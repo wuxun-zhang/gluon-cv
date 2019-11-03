@@ -204,19 +204,29 @@ if __name__ == "__main__":
     logging.info(args)
 
     withQuantization = False
-    model_prefix = args.model + '_' + args.backbone
-    if 'pascal' in args.dataset:
-        model_prefix += '_voc'
-        withQuantization = True if (args.backbone in ['resnet101']) else withQuantization
-    elif args.dataset == 'coco':
-        model_prefix += '_coco'
-        withQuantization = True if (args.backbone in ['resnet101']) else withQuantization
-    elif args.dataset == 'ade20k':
-        model_prefix += '_ade'
-    elif args.dataset == 'citys':
-        model_prefix += '_citys'
+    # model_prefix = args.model + '_' + args.backbone
+    # if 'pascal' in args.dataset:
+    #     model_prefix += '_voc'
+    #     withQuantization = True if (args.backbone in ['resnet101']) else withQuantization
+    # elif args.dataset == 'coco':
+    #     model_prefix += '_coco'
+    #     withQuantization = True if (args.backbone in ['resnet101']) else withQuantization
+    # elif args.dataset == 'ade20k':
+    #     model_prefix += '_ade'
+    # elif args.dataset == 'citys':
+    #     model_prefix += '_citys'
+    # else:
+    #     raise ValueError('Unsupported dataset {} used'.format(args.dataset))
+
+    model_prefix = args.model
+    if 'voc' in model_prefix:
+        args.dataset='pascal_voc'
+    elif 'coco' in model_prefix:
+        args.dataset='coco'
+    elif 'ade' in model_prefix:
+        args.dataset='ade20k'
     else:
-        raise ValueError('Unsupported dataset {} used'.format(args.dataset))
+        args.dataset='citys'
 
     if args.ngpus > 0:
         withQuantization = False
@@ -246,6 +256,19 @@ if __name__ == "__main__":
                     .format(args.resume))
         if args.quantized:
             model.hybridize(static_alloc=True, static_shape=True)
+        else:
+            model.hybridize()
+
+        # temporarily store FP32 models locally
+        if args.calibration:
+            model(mx.nd.ones((1, 3, args.image_shape, args.image_shape)))
+            dir_path = os.path.dirname(os.path.realpath(__file__))
+            dst_dir = os.path.join(dir_path, 'model')
+            if not os.path.isdir(dst_dir):
+                os.mkdir(dst_dir)
+            prefix = os.path.join(dst_dir, model_prefix)
+            logger.info('Saving original FP32 model at %s' % dst_dir)
+            model.export(prefix, epoch=0)
     else:
         model_prefix = 'deploy_int8' if args.quantized else 'deploy'
         model = mx.gluon.SymbolBlock.imports('{}-symbol.json'.format(args.model_prefix),
@@ -257,7 +280,7 @@ if __name__ == "__main__":
 
     # benchmark
     if args.benchmark:
-        print('------benchmarking on %s model------' % model_prefix)
+        print('------benchmarking on %s model------' % args.model_prefix)
         benchmarking(model, args)
         sys.exit()
 

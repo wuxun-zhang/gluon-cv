@@ -15,9 +15,9 @@ from gluoncv.model_zoo import get_model
 # CLI
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a model for image classification.')
-    parser.add_argument('--data-dir', type=str, default='~/.mxnet/datasets/imagenet',
+    parser.add_argument('--data-dir', type=str, default=os.path.expanduser('~/.mxnet/datasets/imagenet'),
                         help='Imagenet directory for validation.')
-    parser.add_argument('--rec-dir', type=str, default='',
+    parser.add_argument('--rec-dir', type=str, default=os.path.expanduser('~/.mxnet/datasets/imagenet/val'),
                         help='recio directory for validation.')
     parser.add_argument('--batch-size', type=int, default=32,
                         help='training batch size per device (CPU/GPU).')
@@ -157,7 +157,17 @@ if __name__ == '__main__':
             net.hybridize(static_alloc=True, static_shape=True)
         else:
             net.hybridize()
-
+        # temporarily store FP32 models locally
+        if opt.calibration:
+            net(mx.nd.ones((1, 3, input_size, input_size)))
+            dir_path = os.path.dirname(os.path.realpath(__file__))
+            dst_dir = os.path.join(dir_path, 'model')
+            if not os.path.isdir(dst_dir):
+                os.mkdir(dst_dir)
+            prefix = os.path.join(dst_dir, opt.model)
+            logger.info('Saving original FP32 model at %s' % dst_dir)
+            net.export(prefix, epoch=0)
+    
     normalize = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 
     """

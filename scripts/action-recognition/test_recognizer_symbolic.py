@@ -5,7 +5,6 @@ import numpy as np
 import mxnet as mx
 import mxnet.ndarray as F
 import gluoncv as gcv
-gcv.utils.check_version('0.6.0')
 from mxnet import gluon, nd, gpu, init, context
 from mxnet import autograd as ag
 from mxnet.gluon import nn
@@ -28,9 +27,9 @@ def parse_args():
                         help='training (and validation) pictures to use.')
     parser.add_argument('--val-data-dir', type=str, default=os.path.expanduser('~/.mxnet/datasets/ucf101/rawframes'),
                         help='validation pictures to use.')
-    parser.add_argument('--train-list', type=str, default=os.path.expanduser('~/.mxnet/datasets/ucf101/ucfTrainTestlist/ucf101_train_split_1_rawframes.txt'),
+    parser.add_argument('--train-list', type=str, default=os.path.expanduser('~/.mxnet/datasets/ucf101/ucfTrainTestlist/ucf101_train_split_2_rawframes.txt'),
                         help='the list of training data')
-    parser.add_argument('--val-list', type=str, default=os.path.expanduser('~/.mxnet/datasets/ucf101/ucfTrainTestlist/ucf101_val_split_1_rawframes.txt'),
+    parser.add_argument('--val-list', type=str, default=os.path.expanduser('~/.mxnet/datasets/ucf101/ucfTrainTestlist/ucf101_val_split_2_rawframes.txt'),
                         help='the list of validation data')
     parser.add_argument('--batch-size', type=int, default=32,
                         help='training batch size per device (CPU/GPU).')
@@ -148,12 +147,6 @@ def parse_args():
                         help='if set to True, read videos directly instead of reading frames.')
     parser.add_argument('--use-decord', action='store_true',
                         help='if set to True, use Decord video loader to load data. Otherwise use mmcv video loader.')
-    parser.add_argument('--slowfast', action='store_true',
-                        help='if set to True, use data loader designed for SlowFast network.')
-    parser.add_argument('--slow-temporal-stride', type=int, default=16,
-                        help='the temporal stride for sparse sampling of video frames for slow branch in SlowFast network.')
-    parser.add_argument('--fast-temporal-stride', type=int, default=2,
-                        help='the temporal stride for sparse sampling of video frames for fast branch in SlowFast network.')
     parser.add_argument('--num-crop', type=int, default=1,
                         help='number of crops for each image. default is 1')
     
@@ -222,12 +215,10 @@ def benchmarking(opt, net, ctx):
     bs = opt.batch_size
     num_iterations = opt.num_iterations
     input_size = opt.input_size
+    input_shape = (bs, 3,) + tuple([input_size, input_size])
     size = num_iterations * bs
-    input_shape = (bs * opt.num_segments, 3, opt.new_length, input_size, input_size)
     data = mx.random.uniform(-1.0, 1.0, shape=input_shape, ctx=ctx[0], dtype='float32')
-    if opt.new_length == 1:
-        # this is for 2D input case
-        data = nd.squeeze(data, axis=2)
+    batch = mx.io.DataBatch([data], [])
     dry_run = 5
 
     # from mxnet import profiler
@@ -241,11 +232,12 @@ def benchmarking(opt, net, ctx):
             if n == dry_run:
                 # profiler.set_state('run')
                 tic = time.time()
-            output = net(data)
+            net.forward(batch, is_train=False)
+            output = net.get_outputs()[0]
             output.wait_to_read()
             pbar.update(bs)
-        # profiler.set_state('stop')
-    # profiler.dumps()
+    #     profiler.set_state('stop')
+    # profiler.dump()
     speed = size / (time.time() - tic)
     print('With batch size %d , %d batches, throughput is %f imgs/sec' % (bs, num_iterations, speed))
 
@@ -253,12 +245,10 @@ def calibration(net, val_data, opt, ctx, logger):
     if isinstance(ctx, list):
         ctx = ctx[0]
     exclude_sym_layer = []
-    exclude_match_layer = []
-    if 'inceptionv3' not in opt.model:
-        exclude_match_layer += ['concat']
+    exclude_match_layer = ['concat']
     if opt.num_gpus > 0:
         raise ValueError('currently only supports CPU with MKL-DNN backend')
-    net = quantize_net(net, calib_data=val_data, quantized_dtype=opt.quantized_dtype, quantize_mode='full', calib_mode=opt.calib_mode,
+    net = quantize_net(net, calib_data=val_data, quantized_dtype=opt.quantized_dtype, calib_mode=opt.calib_mode, 
                        exclude_layers=exclude_sym_layer, num_calib_examples=opt.batch_size * opt.num_calib_batches,
                        exclude_layers_match=exclude_match_layer, ctx=ctx, logger=logger)
     dir_path = os.path.dirname(os.path.realpath(__file__))
@@ -309,23 +299,16 @@ def main(logger):
             print('Pre-trained model %s is successfully loaded.' % (opt.resume_params))
         else:
             print('Pre-trained model is successfully loaded from the model zoo.')
-
-        # temporarily export Fp32 model
-        if opt.calibration:
-            net.hybridize()
-            net(nd.ones((1*opt.num_segments, 3, opt.input_size, opt.input_size)))
-            dir_path = os.path.dirname(os.path.realpath(__file__))
-            dst_dir = os.path.join(dir_path, 'model')
-            if not os.path.isdir(dst_dir):
-                os.mkdir(dst_dir)
-            prefix = os.path.join(dst_dir, model_name)
-            logger.info('Saving original FP32 model at %s' % dst_dir)
-            net.export(prefix, epoch=0)
     else:
-        model_name = 'deploy'
-        net = mx.gluon.SymbolBlock.imports('{}-symbol.json'.format(opt.model_prefix),
-                ['data'], '{}-0000.params'.format(opt.model_prefix))
-        net.hybridize(static_alloc=True, static_shape=True) 
+        # model_name = 'deploy'
+        # net = mx.gluon.SymbolBlock.imports('{}-symbol.json'.format(opt.model_prefix),
+        #         ['data'], '{}-0000.params'.format(opt.model_prefix))
+        # net.hybridize(static_alloc=True, static_shape=True) 
+        sym, arg_params, aux_params = mx.model.load_checkpoint(opt.model_prefix, 0)
+        logger.info('Successfully loaded symbol from %s ' % (opt.model_prefix))
+        net = mx.module.Module(sym, data_names=('data',), label_names=None, fixed_param_names=sym.list_arguments())
+        net.bind(data_shapes=[('data', (opt.batch_size*opt.num_segments, 3, opt.input_size, opt.input_size))], for_training=False, grad_req=None)
+        net.set_params(arg_params, aux_params)
 
     # dummy data for benchmarking performance
     if opt.benchmark:
@@ -334,56 +317,20 @@ def main(logger):
         sys.exit()
 
     # get data
-    image_norm_mean = [0.485, 0.456, 0.406]
-    image_norm_std = [0.229, 0.224, 0.225]
     if opt.ten_crop:
         transform_test = transforms.Compose([
             video.VideoTenCrop(opt.input_size),
             video.VideoToTensor(),
-            video.VideoNormalize(image_norm_mean, image_norm_std)
+            video.VideoNormalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
     elif opt.three_crop:
         transform_test = transforms.Compose([
             video.VideoThreeCrop(opt.input_size),
             video.VideoToTensor(),
-            video.VideoNormalize(image_norm_mean, image_norm_std)
+            video.VideoNormalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
     else:
-        transform_test = video.VideoGroupValTransform(size=opt.input_size, mean=image_norm_mean, std=image_norm_std)
-        opt.num_crop = 1
-
-    if not opt.deploy:
-        # get model
-        if opt.use_pretrained and len(opt.hashtag) > 0:
-            opt.use_pretrained = opt.hashtag
-        classes = opt.num_classes
-        model_name = opt.model
-        # Currently, these is no hashtag for int8 models.
-        if opt.quantized:
-            model_name += '_int8'
-            opt.use_pretrained = True
-        
-        net = get_model(name=model_name, nclass=classes, pretrained=opt.use_pretrained, num_segments=opt.num_segments, num_crop=opt.num_crop)
-        net.cast(opt.dtype)
-        net.collect_params().reset_ctx(context)
-        if opt.mode == 'hybrid':
-            net.hybridize(static_alloc=True, static_shape=True)
-        if opt.resume_params is not '' and not opt.use_pretrained:
-            net.load_parameters(opt.resume_params, ctx=context)
-            print('Pre-trained model %s is successfully loaded.' % (opt.resume_params))
-        else:
-            print('Pre-trained model is successfully loaded from the model zoo.')
-    else:
-        model_name = 'deploy'
-        net = mx.gluon.SymbolBlock.imports('{}-symbol.json'.format(opt.model_prefix),
-                    ['data'], '{}-0000.params'.format(opt.model_prefix))
-        net.hybridize(static_alloc=True, static_shape=True)
-
-    print("Successfully loaded model {}".format(model_name))
-    # dummy data for benchmarking performance
-    if opt.benchmark:
-        benchmarking(opt, net, context)
-        sys.exit()
+        transform_test = video.VideoGroupValTransform(size=opt.input_size, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
     if opt.dataset == 'ucf101':
         val_dataset = UCF101(setting=opt.val_list, root=opt.data_dir, train=False,
@@ -392,10 +339,9 @@ def main(logger):
                                                test_mode=True, num_segments=opt.num_segments, transform=transform_test)
     elif opt.dataset == 'kinetics400':
         val_dataset = Kinetics400(setting=opt.val_list, root=opt.data_dir, train=False,
-                                  new_width=opt.new_width, new_height=opt.new_height, new_length=opt.new_length, new_step=opt.new_step,
-                                  target_width=opt.input_size, target_height=opt.input_size, video_loader=opt.video_loader, use_decord=opt.use_decord,
-                                  slowfast=opt.slowfast, slow_temporal_stride=opt.slow_temporal_stride, fast_temporal_stride=opt.fast_temporal_stride,
-                                  test_mode=True, num_segments=opt.num_segments, num_crop=opt.num_crop, transform=transform_test)
+                                               new_width=opt.new_width, new_height=opt.new_height, new_length=opt.new_length, new_step=opt.new_step,
+                                               target_width=opt.input_size, target_height=opt.input_size, video_loader=opt.video_loader, use_decord=opt.use_decord,
+                                               test_mode=True, num_segments=opt.num_segments, transform=transform_test)
     elif opt.dataset == 'somethingsomethingv2':
         val_dataset = SomethingSomethingV2(setting=opt.val_list, root=opt.data_dir, train=False,
                                            new_width=opt.new_width, new_height=opt.new_height, new_length=opt.new_length, new_step=opt.new_step,

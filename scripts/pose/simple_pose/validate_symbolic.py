@@ -8,8 +8,6 @@ from mxnet.gluon import nn
 from mxnet.gluon.data.vision import transforms
 from mxnet.contrib.quantization import *
 
-import gluoncv as gcv
-gcv.utils.check_version('0.6.0')
 from gluoncv.data import mscoco
 from gluoncv.model_zoo import get_model
 from gluoncv.utils import makedirs
@@ -18,7 +16,7 @@ from gluoncv.data.transforms.presets.simple_pose import SimplePoseDefaultTrainTr
 from gluoncv.utils.metrics.coco_keypoints import COCOKeyPointsMetric
 
 # CLI
-parser = argparse.ArgumentParser(description='Validate a model for pose estimation.')
+parser = argparse.ArgumentParser(description='Train a model for image classification.')
 parser.add_argument('--data-dir', type=str, default='~/.mxnet/datasets/coco',
                     help='training and validation pictures to use.')
 parser.add_argument('--num-joints', type=int, required=True,
@@ -62,7 +60,7 @@ parser.add_argument('--num-calib-batches', type=int, default=5,
 parser.add_argument('--quantized-dtype', type=str, default='auto', 
                     choices=['auto', 'int8', 'uint8'],
                     help='quantization destination data type for input data')
-parser.add_argument('--calib-mode', type=str, default='naive',
+parser.add_argument('--calib-mode', type=str, default='entropy',
                     help='calibration mode used for generating calibration table for the quantized symbol; supports'
                         ' 1. none: no calibration will be used. The thresholds for quantization will be calculated'
                         ' on the fly. This will result in inference speed slowdown and loss of accuracy'
@@ -86,18 +84,13 @@ batch_size = opt.batch_size
 num_joints = 17
 
 num_gpus = opt.num_gpus
-context = [mx.cpu()]
-if num_gpus > 0:
-    batch_size *= max(1, num_gpus)
-    context = [mx.gpu(i) for i in range(num_gpus)]
-
+# batch_size *= max(1, num_gpus)
+context = [mx.gpu(i) for i in range(num_gpus)] if num_gpus > 0 else [mx.cpu()]
 num_workers = opt.num_workers
 
 def get_data_loader(data_dir, batch_size, num_workers, input_size):
 
     def val_batch_fn(batch, ctx):
-
-        
         data = gluon.utils.split_and_load(batch[0], ctx_list=ctx,
                                           batch_axis=0, even_split=False)
         scale = batch[1]
@@ -123,52 +116,16 @@ def get_data_loader(data_dir, batch_size, num_workers, input_size):
     return val_dataset, val_data, val_batch_fn
 
 input_size = [int(i) for i in opt.input_size.split(',')]
-
-if opt.calibration or not opt.benchmark:
-    val_dataset, val_data, val_batch_fn = get_data_loader(opt.data_dir, batch_size,
-                                                          num_workers, input_size)
-    val_metric = COCOKeyPointsMetric(val_dataset, 'coco_keypoints',
-                                     data_shape=tuple(input_size),
-                                     in_vis_thresh=opt.score_threshold)
+val_dataset, val_data, val_batch_fn = get_data_loader(opt.data_dir, batch_size,
+                                                      num_workers, input_size)
+val_metric = COCOKeyPointsMetric(val_dataset, 'coco_keypoints',
+                                 data_shape=tuple(input_size),
+                                 in_vis_thresh=opt.score_threshold)
 
 use_pretrained = True if not opt.params_file else False
-model_name = opt.model if not opt.quantized else '_'.join([opt.model, 'int8'])
+model_name = opt.model
 
-if not opt.deploy:
-    net = get_model(model_name, ctx=context, num_joints=num_joints, pretrained=use_pretrained)
-    if not use_pretrained:
-        net.load_parameters(opt.params_file, ctx=context)
-    if opt.quantized:
-        net.hybridize(static_alloc=True, static_shape=True)
-    else:
-        net.hybridize()
-else:
-    model_name = 'deploy'
-    net = mx.gluon.SymbolBlock.imports('{}-symbol.json'.format(opt.model_prefix),
-              ['data'], '{}-0000.params'.format(opt.model_prefix))
-    net.hybridize(static_alloc=True, static_shape=True)
-
-print("Inference on model {} started!".format(model_name))
-
-# calibration on FP32 model
-def calibration(net, val_data, opt, ctx, logger):
-    exclude_sym_layer = []
-    exclude_match_layer = []
-    if num_gpus > 0:
-        raise ValueError('currently only supports CPU with MKL-DNN backend')
-    net = quantize_net(net, calib_data=val_data, quantized_dtype=opt.quantized_dtype, calib_mode=opt.calib_mode, 
-                       exclude_layers=exclude_sym_layer, num_calib_examples=opt.batch_size * opt.num_calib_batches,
-                       exclude_layers_match=exclude_match_layer, ctx=ctx, logger=logger)
-    dir_path = os.path.dirname(os.path.realpath(__file__))
-    dst_dir = os.path.join(dir_path, 'model')
-    if not os.path.isdir(dst_dir):
-        os.mkdir(dst_dir)
-    prefix = os.path.join(dst_dir, opt.model + '-quantized-' + opt.calib_mode)
-    logger.info('Saving quantized model at %s' % dst_dir)
-    net.export(prefix, epoch=0)
-
-
-# opt.deploy = True
+opt.deploy = True
 if not opt.deploy: 
     net = get_model(model_name, ctx=context, num_joints=num_joints, pretrained=use_pretrained)
     if not use_pretrained:
@@ -187,9 +144,14 @@ if not opt.deploy:
         net.export(prefix, epoch=0)
 else:
     model_name = 'deploy'
-    net = mx.gluon.SymbolBlock.imports('{}-symbol.json'.format(opt.model_prefix),
-                  ['data'], '{}-0000.params'.format(opt.model_prefix))
-    net.hybridize(static_alloc=True, static_shape=True)   
+    # net = mx.gluon.SymbolBlock.imports('{}-symbol.json'.format(opt.model_prefix),
+    #               ['data'], '{}-0000.params'.format(opt.model_prefix))
+    sym, arg_params, aux_params = mx.model.load_checkpoint(opt.model_prefix, 0)
+    logger.info('Successfully loaded symbol from %s ' % (opt.model_prefix))
+    net = mx.module.Module(sym, data_names=('data',), label_names=None, fixed_param_names=sym.list_arguments())
+    net.bind(data_shapes=[('data', (opt.batch_size, 3, input_size[0], input_size[1]))], for_training=False, grad_req=None)
+    net.set_params(arg_params, aux_params)
+    # net.hybridize(static_alloc=True, static_shape=True)   
 
 # calibration on FP32 model
 def calibration(net, val_data, opt, ctx, logger):
@@ -234,8 +196,7 @@ def validate(val_data, val_dataset, net, ctx):
         preds, maxvals = get_final_preds(outputs_stack, center.asnumpy(), scale.asnumpy())
         val_metric.update(preds, maxvals, score, imgid)
 
-    metric_name, metric_score = val_metric.get()
-    print("Inference Completed! %s = %.4f" % (metric_name, metric_score))
+    res = val_metric.get()
     return
 
 
@@ -247,8 +208,8 @@ def benchmarking(net, opt, ctx):
     num_iterations = opt.num_iterations
     input_shape = (bs, 3, ) + tuple(input_size)
     size = num_iterations * bs
-    data = mx.random.uniform(-1.0, 1.0, shape=input_shape, ctx=ctx[0], dtype='float32')
-    batch = mx.io.DataBatch([data], [])
+    data = [mx.random.uniform(-1.0, 1.0, shape=input_shape, ctx=ctx[0], dtype='float32')]
+    batch = mx.io.DataBatch(data, [])
     dry_run = 5
 
     # from mxnet import profiler
@@ -262,10 +223,11 @@ def benchmarking(net, opt, ctx):
             if n == dry_run:
                 # profiler.set_state('run')
                 tic = time.time()
-            output = net(data)
-            output.wait_to_read()
+            net.forward(batch, is_train=False)
+            for output in net.get_outputs():
+                output.wait_to_read()
             pbar.update(bs)
-        # profiler.set_state('stop')
+    #     profiler.set_state('stop')
     # profiler.dump()
     speed = size / (time.time() - tic)
     print('With batch size %d , %d batches, throughput is %f imgs/sec' % (bs, num_iterations, speed))
@@ -278,7 +240,6 @@ if __name__ == '__main__':
 
     opt.benchmark = True
     if opt.benchmark:
-        print("Benchmarking on {}".format(opt.model_prefix))
         benchmarking(net, opt, context)
     else:
         validate(val_data, val_dataset, net, context)

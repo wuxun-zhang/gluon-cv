@@ -12,7 +12,6 @@ from tqdm import tqdm
 from mxnet import nd
 from mxnet import gluon
 import gluoncv as gcv
-gcv.utils.check_version('0.6.0')
 from gluoncv import data as gdata
 from gluoncv.data.batchify import Tuple, Stack, Pad
 from gluoncv.data.transforms.presets.ssd import SSDDefaultValTransform
@@ -37,7 +36,7 @@ def parse_args():
     parser.add_argument('--benchmark', action='store_true',
                         help="run dummy-data based benchmarking")
     parser.add_argument('--num-iterations', type=int, default=100,
-                        help="number of benchmarking iterations.")
+                        help="number of benchmarking iterations.")     
     parser.add_argument('--dataset', type=str, default='voc',
                         help='eval dataset.')
     parser.add_argument('--num-workers', '-j', dest='num_workers', type=int,
@@ -52,7 +51,7 @@ def parse_args():
                         help='quantize model')
     parser.add_argument('--num-calib-batches', type=int, default=5,
                         help='number of batches for calibration')
-    parser.add_argument('--quantized-dtype', type=str, default='auto',
+    parser.add_argument('--quantized-dtype', type=str, default='auto', 
                         choices=['auto', 'int8', 'uint8'],
                         help='quantization destination data type for input data')
     parser.add_argument('--calib-mode', type=str, default='naive',
@@ -96,14 +95,14 @@ def get_dataloader(val_dataset, data_shape, batch_size, num_workers):
 def benchmarking(net, ctx, num_iteration, datashape=300, batch_size=64):
     input_shape = (batch_size, 3) + (datashape, datashape)
     data = mx.random.uniform(-1.0, 1.0, shape=input_shape, ctx=ctx, dtype='float32')
+    batch = mx.io.DataBatch([data], [])
     dryrun = 5
     for i in range(dryrun + num_iteration):
         if i == dryrun:
             tic = time.time()
-        ids, scores, bboxes = net(data)
-        ids.asnumpy()
-        scores.asnumpy()
-        bboxes.asnumpy()
+        net.forward(batch, is_train=False)
+        for out in net.get_outputs():
+            out.asnumpy()
     toc = time.time() - tic
     return toc
 
@@ -166,28 +165,18 @@ if __name__ == '__main__':
             net.load_parameters(args.pretrained.strip())
         net.set_nms(nms_thresh=0.45, nms_topk=400)
         net.hybridize()
-
-        # temporarily export Fp32 model
-        if args.calibration:
-            net.hybridize()
-            net(nd.ones((1, 3, args.data_shape, args.data_shape)))
-            dir_path = os.path.dirname(os.path.realpath(__file__))
-            dst_dir = os.path.join(dir_path, 'model')
-            if not os.path.isdir(dst_dir):
-                os.mkdir(dst_dir)
-            prefix = os.path.join(dst_dir, net_name)
-            logger.info('Saving original FP32 model at %s' % dst_dir)
-            net.export(prefix, epoch=0)
     else:
         net_name = 'deploy'
-        net = mx.gluon.SymbolBlock.imports('{}-symbol.json'.format(args.model_prefix),
-              ['data'], '{}-0000.params'.format(args.model_prefix))
-        net.hybridize(static_alloc=True, static_shape=True)
+        sym, arg_params, aux_params = mx.model.load_checkpoint(args.model_prefix, 0)
+        logger.info('Successfully loaded symbol from %s ' % (args.model_prefix))
+        net = mx.module.Module(sym, data_names=('data',), label_names=None, fixed_param_names=sym.list_arguments())
+        net.bind(data_shapes=[('data', (args.batch_size, 3, args.data_shape, args.data_shape))], for_training=False, grad_req=None)
+        net.set_params(arg_params, aux_params)
 
     if args.benchmark:
         print('-----benchmarking on %s -----'%net_name)
         #input_shape = (args.batch_size, 3) + (args.data_shape, args.data_shape)
-        #data = mx.random.uniform(-1.0, 1.0, shape=input_shape, ctx=ctx[0], dtype='float32')
+        #data = mx.random.uniform(-1.0, 1.0, shape=input_shape, ctx=ctx[0], dtype='float32')  
         speed = (args.batch_size*args.num_iterations)/benchmarking(net, ctx=ctx[0], num_iteration=args.num_iterations,
                 datashape=args.data_shape, batch_size=args.batch_size)
         print('Inference speed on %s, with batchsize %d is %.2f img/sec'%(net_name, args.batch_size, speed))
