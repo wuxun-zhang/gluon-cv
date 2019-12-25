@@ -180,6 +180,8 @@ def parse_args():
                             ' thresholds. This mode is expected to produce the best inference accuracy of all three'
                             ' kinds of quantized models if the calibration dataset is representative enough of the'
                             ' inference dataset.')
+    parser.add_argument('--symbolic', action='store_true',
+                        help='using symbolic model, turn on profiler')
     opt = parser.parse_args()
     return opt
 
@@ -240,6 +242,42 @@ def benchmarking(opt, net, ctx):
     speed = size / (time.time() - tic)
     print('With batch size %d , %d batches, throughput is %f imgs/sec' % (bs, num_iterations, speed))
 
+def benchmarking_symbolic(opt, net, ctx):
+    bs = opt.batch_size
+    num_iterations = opt.num_iterations
+    input_size = opt.input_size
+    size = num_iterations * bs
+    input_shape = (bs * opt.num_segments, 3, opt.new_length, input_size, input_size)
+    data = mx.random.uniform(-1.0, 1.0, shape=input_shape, ctx=ctx[0], dtype='float32')
+    if opt.new_length == 1:
+        # this is for 2D input case
+        data = nd.squeeze(data, axis=2)
+    dry_run = 5
+
+    batch = mx.io.DataBatch([data], [])
+
+    from mxnet import profiler
+    profiler.set_config(profile_all=True,
+                        aggregate_stats=True,
+                        continuous_dump=True,
+                        filename='{}_profile.json'.format('fp32' if not opt.quantized else 'int8'))
+
+    from tqdm import tqdm
+    with tqdm(total=size + dry_run * bs) as pbar:
+        for n in range(dry_run + num_iterations):
+            if n == dry_run:
+                profiler.set_state('run')
+                tic = time.time()
+            # output = net(data)
+            net.forward(batch, is_train=False)
+            # output.wait_to_read()
+            for out in net.get_outputs():
+                out.asnumpy()
+            pbar.update(bs)
+        profiler.set_state('stop')
+    print(profiler.dumps())
+    speed = size / (time.time() - tic)
+    print('With batch size %d , %d batches, throughput is %f imgs/sec' % (bs, num_iterations, speed))
 
 def calibration(net, val_data, opt, ctx, logger):
     if isinstance(ctx, list):
@@ -248,6 +286,9 @@ def calibration(net, val_data, opt, ctx, logger):
     exclude_match_layer = []
     if 'inceptionv3' not in opt.model:
         exclude_match_layer += ['concat']
+    if 'i3d' in opt.model:
+        exclude_match_layer += ['pool']
+
     if opt.num_gpus > 0:
         raise ValueError('currently only supports CPU with MKL-DNN backend')
     net = quantize_net(net, calib_data=val_data, quantized_dtype=opt.quantized_dtype, quantize_mode='full', calib_mode=opt.calib_mode,
@@ -325,14 +366,28 @@ def main(logger):
             print('Pre-trained model is successfully loaded from the model zoo.')
     else:
         model_name = 'deploy'
-        net = mx.gluon.SymbolBlock.imports('{}-symbol.json'.format(opt.model_prefix),
-                    ['data'], '{}-0000.params'.format(opt.model_prefix))
-        net.hybridize(static_alloc=True, static_shape=True)
+        if not opt.symbolic:
+            net = mx.gluon.SymbolBlock.imports('{}-symbol.json'.format(opt.model_prefix),
+                        ['data'], '{}-0000.params'.format(opt.model_prefix))
+            net.hybridize(static_alloc=True, static_shape=True)
+        else:
+            sym, arg_params, aux_params = mx.model.load_checkpoint(opt.model_prefix, 0)
+            logger.info('Successfully loaded symbol from %s ' % (opt.model_prefix))
+            net = mx.module.Module(sym, data_names=('data',), label_names=None, fixed_param_names=sym.list_arguments())
+            input_shape = (opt.batch_size * opt.num_segments, 3, opt.new_length, opt.input_size, opt.input_size)
+            if opt.new_length == 1:
+                # this is for 2D input case
+                input_shape = (input_shape[:2], input_shape[3:])
+            net.bind(data_shapes=[('data', input_shape)], for_training=False, grad_req=None)
+            net.set_params(arg_params, aux_params)
 
     print("Successfully loaded model {}".format(model_name))
     # dummy data for benchmarking performance
     if opt.benchmark:
-        benchmarking(opt, net, context)
+        if not opt.symbolic:
+            benchmarking(opt, net, context)
+        else:
+            benchmarking_symbolic(opt, net, context)
         sys.exit()
 
     if opt.dataset == 'ucf101':
