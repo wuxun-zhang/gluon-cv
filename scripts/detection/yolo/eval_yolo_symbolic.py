@@ -70,6 +70,9 @@ def parse_args():
                              ' thresholds. This mode is expected to produce the best inference accuracy of all three'
                              ' kinds of quantized models if the calibration dataset is representative enough of the'
                              ' inference dataset.')
+    # add tensorrt inference option
+    parser.add_argument('--use-tensorrt', action="store_true", default=False, 
+                        help='enable tensor-rt backend')
     args = parser.parse_args()
     return args
 
@@ -162,6 +165,9 @@ if __name__ == '__main__':
     logging.info(args)
 
     # training contexts
+    if args.use_tensorrt:
+        assert len(args.gpus) > 0, "Must specify gpu id when using Tensor-RT inference engine"
+        assert not args.calibration, "Currently, calibration/quantization is not supported on GPU platform, please try int8 models on CPU"
     ctx = [mx.gpu(int(i)) for i in args.gpus.split(',') if i.strip()]
     ctx = ctx if ctx else [mx.cpu()]
 
@@ -178,6 +184,7 @@ if __name__ == '__main__':
             net.load_parameters(args.pretrained.strip())
         net.set_nms(nms_thresh=0.45, nms_topk=400)
         net.hybridize(static_alloc=True, static_shape=True)
+        net.collect_params().reset_ctx(ctx)
     else:
         net_name = 'deploy'
         # net = mx.gluon.SymbolBlock.imports('{}-symbol.json'.format(args.model_prefix),
@@ -185,8 +192,13 @@ if __name__ == '__main__':
         # net.hybridize(static_alloc=True, static_shape=True)
         sym, arg_params, aux_params = mx.model.load_checkpoint(args.model_prefix, 0)
         logger.info('Successfully loaded symbol from %s ' % (args.model_prefix))
-        input_shape = input_shape = (args.batch_size, 3) + (args.data_shape, args.data_shape)
-        net = mx.module.Module(sym, data_names=('data',), label_names=None, fixed_param_names=sym.list_arguments())
+        if args.use_tensorrt:
+            logger.info('Starting building Tensor-RT engine')
+            sym = sym.get_backend_symbol('TensorRT')
+            arg_params, aux_params = mx.contrib.tensorrt.init_tensorrt_params(sym, arg_params, aux_params)
+            mx.contrib.tensorrt.set_use_fp16(True)
+        input_shape = (args.batch_size, 3) + (args.data_shape, args.data_shape)
+        net = mx.module.Module(sym, data_names=('data',), label_names=None, fixed_param_names=sym.list_arguments(), context=ctx[0])
         net.bind(data_shapes=[('data', input_shape)], for_training=False, grad_req=None)
         net.set_params(arg_params, aux_params)
 

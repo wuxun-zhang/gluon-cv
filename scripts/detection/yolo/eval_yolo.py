@@ -170,6 +170,8 @@ if __name__ == '__main__':
               ['data'], '{}-0000.params'.format(args.model_prefix))
         net.hybridize(static_alloc=True, static_shape=True)
 
+    net.collect_params().reset_ctx(ctx)
+
     if args.benchmark:
         print('-----benchmarking on %s -----'%net_name)  
         speed = (args.batch_size*args.num_iterations)/benchmarking(net, ctx=ctx[0], net_name=net_name, num_iteration=args.num_iterations,
