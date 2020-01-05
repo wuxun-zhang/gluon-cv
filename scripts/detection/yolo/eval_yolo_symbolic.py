@@ -98,16 +98,30 @@ def get_dataloader(val_dataset, data_shape, batch_size, num_workers):
 def benchmarking(net, ctx, num_iteration, net_name, datashape=416, batch_size=64):
     input_shape = (batch_size, 3) + (datashape, datashape)
     data = mx.random.uniform(-1.0, 1.0, shape=input_shape, ctx=ctx, dtype='float32')
+    batch = mx.io.DataBatch([data], [])
     dryrun = 5
+
+    from mxnet import profiler
+    profiler.set_config(profile_all=True,
+                        aggregate_stats=True,
+                        continuous_dump=True,
+                        filename='profile.json')
+
     for i in range(dryrun + num_iteration):
         if i == dryrun:
-            net.export('./model/' + net_name, 0)
+            # net.export('./model/' + net_name, 0)
+            profiler.set_state('run')
             tic = time.time()
-        ids, scores, bboxes = net(data)
-        ids.asnumpy()
-        scores.asnumpy()
-        bboxes.asnumpy()
+        # ids, scores, bboxes = net(data)
+        net.forward(batch, is_train=False)
+        for out in net.get_outputs():
+            out.asnumpy()
+        # ids.asnumpy()
+        # scores.asnumpy()
+        # bboxes.asnumpy()
     toc = time.time() - tic
+    profiler.set_state('stop')
+    profiler.dump()
     return toc
 
 def validate(net, val_data, ctx, classes, size, metric):
@@ -166,9 +180,15 @@ if __name__ == '__main__':
         net.hybridize(static_alloc=True, static_shape=True)
     else:
         net_name = 'deploy'
-        net = mx.gluon.SymbolBlock.imports('{}-symbol.json'.format(args.model_prefix),
-              ['data'], '{}-0000.params'.format(args.model_prefix))
-        net.hybridize(static_alloc=True, static_shape=True)
+        # net = mx.gluon.SymbolBlock.imports('{}-symbol.json'.format(args.model_prefix),
+        #       ['data'], '{}-0000.params'.format(args.model_prefix))
+        # net.hybridize(static_alloc=True, static_shape=True)
+        sym, arg_params, aux_params = mx.model.load_checkpoint(args.model_prefix, 0)
+        logger.info('Successfully loaded symbol from %s ' % (args.model_prefix))
+        input_shape = input_shape = (args.batch_size, 3) + (args.data_shape, args.data_shape)
+        net = mx.module.Module(sym, data_names=('data',), label_names=None, fixed_param_names=sym.list_arguments())
+        net.bind(data_shapes=[('data', input_shape)], for_training=False, grad_req=None)
+        net.set_params(arg_params, aux_params)
 
     if args.benchmark:
         print('-----benchmarking on %s -----'%net_name)  

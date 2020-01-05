@@ -23,17 +23,33 @@ calibrate_classification_models() {
 }
 
 calibrate_detection_models() {
-    backbone_list=("vgg16_atrous" "mobilenet1.0" "resnet50_v1")
-    # enter ./classification/imagenet
-    cd ./detection/ssd
+    # backbone_list=("vgg16_atrous" "mobilenet1.0" "resnet50_v1")
+
+    # cd ./detection/ssd
+    # for net_name in ${backbone_list[@]}
+    # do
+    #     model_file="./model/ssd_512_${net_name}_voc-quantized-naive-symbol.json"
+    #     if [ -f ${model_file} ];then
+    #         echo "${model_file} has existed. Skipping calibration..."
+    #         continue
+    #     fi
+    #     python eval_ssd.py --network=${net_name} --data-shape=512 --batch-size=4 --calibration
+    # done
+
+    backbone_list=("darknet53" "mobilenet1.0")
+    dataset_list=("voc" "coco")
+    cd ./detection/yolo
     for net_name in ${backbone_list[@]}
     do
-        model_file="./model/ssd_512_${net_name}_voc-quantized-naive-symbol.json"
-        if [ -f ${model_file} ];then
-            echo "${model_file} has existed. Skipping calibration..."
-            continue
-        fi
-        python eval_ssd.py --network=${net_name} --data-shape=512 --batch-size=4 --calibration
+    	for dataset in ${dataset_list[@]}
+    	do
+    		model_file="./model/yolo3_${net_name}_${dataset}-quantized-naive-symbol.json"
+    		if [ -f ${model_file} ];then
+	            echo "${model_file} has existed. Skipping calibration..."
+	            continue
+        	fi
+        	python eval_yolo.py --network=${net_name} --gpus='' --calibration --calib-mode=naive --dataset=${dataset}
+    	done
     done
     cd ../..
 }
@@ -159,15 +175,30 @@ benchmark_detection_symbolic_models() {
 }
 
 benchmark_detection_gluon_models() {
-    backbone_list=("vgg16_atrous" "mobilenet1.0" "resnet50_v1")
-    # enter ./classification/imagenet
-    cd ./detection/ssd
+    # backbone_list=("vgg16_atrous" "mobilenet1.0" "resnet50_v1")
+    # cd ./detection/ssd
+    # for net_name in ${backbone_list[@]}
+    # do
+    #     echo ">>> Benchmarking FP32 model..."
+    #     taskset -c 0-$2 python eval_ssd.py --network=${net_name} --data-shape=512 --batch-size=$1 --deploy --model-prefix=./model/ssd_512_${net_name}_voc --benchmark
+    #     echo ">>> Benchmarking INT8 model..."
+    #     taskset -c 0-$2 python eval_ssd.py --network=${net_name} --data-shape=512 --batch-size=$1 --deploy --model-prefix=./model/ssd_512_${net_name}_voc-quantized-naive --benchmark
+    # done
+    
+    backbone_list=("darknet53" "mobilenet1.0")
+    dataset_list=("voc" "coco")
+    cd ./detection/yolo
     for net_name in ${backbone_list[@]}
     do
-        echo ">>> Benchmarking FP32 model..."
-        taskset -c 0-$2 python eval_ssd.py --network=${net_name} --data-shape=512 --batch-size=$1 --deploy --model-prefix=./model/ssd_512_${net_name}_voc --benchmark
-        echo ">>> Benchmarking INT8 model..."
-        taskset -c 0-$2 python eval_ssd.py --network=${net_name} --data-shape=512 --batch-size=$1 --deploy --model-prefix=./model/ssd_512_${net_name}_voc-quantized-naive --benchmark
+    	for dataset in ${dataset_list[@]}
+    	do
+    		echo ">>> Benchmarking FP32 model..."
+	        # taskset -c 0-$2 python eval_yolo.py --network=${net_name} --batch-size=$1 --deploy --model-prefix=./model/yolo3_${net_name}_${dataset} --benchmark
+	        taskset -c 0-$2 python eval_yolo.py --network=${net_name} --gpus='' --dataset=${dataset} --batch-size=$1 --benchmark
+
+	        echo ">>> Benchmarking INT8 model..."
+	        taskset -c 0-$2 python eval_yolo.py --network=${net_name} --gpus='' --batch-size=$1 --deploy --model-prefix=./model/yolo3_${net_name}_${dataset}-quantized-naive --benchmark
+    	done
     done
     cd ../..
 }
@@ -299,11 +330,14 @@ export PYTHONPATH=~/github/incubator-mxnet/python:~/github/gluon-cv
 # benchmark_classification_gluon_models 64 ${BIND_MAX_CORE_ID} > ./logs/benchmark_imagenet_gluon_models.log 2>&1 
 # rm $(pwd)/classification/imagenet/model/*
 
-# echo "INFO: Starting calibrating FP32 detection models..."
-# calibrate_detection_models > ./logs/calib_detection_models.log 2>&1 
-# echo "INFO: Starting benchmarking detection models..."
+echo "INFO: Starting calibrating FP32 detection models..."
+calibrate_detection_models > calib_detection_models.log 2>&1
+echo "INFO: Starting benchmarking detection models..."
 # benchmark_detection_symbolic_models 64 ${BIND_MAX_CORE_ID} > ./logs/benchmark_detection_symbolic_models.log 2>&1
-# benchmark_detection_gluon_models 64 ${BIND_MAX_CORE_ID} > ./logs/benchmark_detection_gluon_models.log 2>&1
+benchmark_detection_gluon_models 64 ${BIND_MAX_CORE_ID} > benchmark_detection_gluon_models_bs-64.log 2>&1
+grep speed benchmark_detection_gluon_models_bs-64.log | awk '{ speed = $(NF-1) }; END { print "Inference speed with batch-size 64 is " speed " images/sec"}'
+benchmark_detection_gluon_models 1 ${BIND_MAX_CORE_ID} > benchmark_detection_gluon_models_bs-1.log 2>&1
+grep speed benchmark_detection_gluon_models_bs-1.log | awk '{ speed = $(NF-1) }; END { print "Inference speed with batch-size 1 is " speed " images/sec"}'
 # rm $(pwd)/detection/ssd/model/*
 
 # echo "INFO: Starting calibrating FP32 segmentation models..."
@@ -320,9 +354,9 @@ export PYTHONPATH=~/github/incubator-mxnet/python:~/github/gluon-cv
 # benchmark_pose_estimation_gluon_models 64 ${BIND_MAX_CORE_ID} > ./logs/benchmark_estimation_gluon_models.log 2>&1
 # rm $(pwd)/pose/simple_pose/model/*
 
-echo "INFO: Starting calibrating FP32 action recognition models..."
-calibrate_action_recognition_models > ./logs/calib_recognition_models.log 2>&1
-echo "INFO: Starting benchmarking action recognition models..."
-benchmark_action_recognition_symbolic_models 64 ${BIND_MAX_CORE_ID} > ./logs/benchmark_recognition_symbolic_models.log 2>&1
-benchmark_action_recognition_gluon_models 64 ${BIND_MAX_CORE_ID} > ./logs/benchmark_recognition_gluon_models.log 2>&1
-rm $(pwd)/action-recognition/model/*
+# echo "INFO: Starting calibrating FP32 action recognition models..."
+# calibrate_action_recognition_models > ./logs/calib_recognition_models.log 2>&1
+# echo "INFO: Starting benchmarking action recognition models..."
+# benchmark_action_recognition_symbolic_models 64 ${BIND_MAX_CORE_ID} > ./logs/benchmark_recognition_symbolic_models.log 2>&1
+# benchmark_action_recognition_gluon_models 64 ${BIND_MAX_CORE_ID} > ./logs/benchmark_recognition_gluon_models.log 2>&1
+# rm $(pwd)/action-recognition/model/*
