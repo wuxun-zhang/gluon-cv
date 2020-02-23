@@ -15,6 +15,7 @@ from gluoncv import data as gdata
 from gluoncv import utils as gutils
 from gluoncv.model_zoo import get_model
 from gluoncv.data.batchify import Tuple, Stack, Pad
+from gluoncv.data.sampler import SplitSampler
 from gluoncv.data.transforms.presets.ssd import SSDDefaultTrainTransform
 from gluoncv.data.transforms.presets.ssd import SSDDefaultValTransform
 from gluoncv.data.transforms.presets.ssd import SSDDALIPipeline
@@ -55,9 +56,12 @@ def parse_args():
                         help='Training with GPUs, you can specify 1,3 for example.')
     parser.add_argument('--epochs', type=int, default=240,
                         help='Training epochs.')
-    parser.add_argument('--resume', type=str, default='',
+    parser.add_argument('--resume-params', type=str, default='',
                         help='Resume from previously saved parameters if not None. '
                         'For example, you can resume from ./ssd_xxx_0123.params')
+    parser.add_argument('--resume-states', type=str, default='',
+                        help='Resume from previously saved trainer states if not None. '
+                        'For example, you can resume from ./ssd_xxx_0123.states')
     parser.add_argument('--start-epoch', type=int, default=0,
                         help='Starting epoch for resuming, default is 0 for new training.'
                         'You can specify it to 100 for example to start from 100 epoch.')
@@ -73,7 +77,7 @@ def parse_args():
                         help='Weight decay, default is 5e-4')
     parser.add_argument('--log-interval', type=int, default=100,
                         help='Logging mini-batch interval. Default is 100.')
-    parser.add_argument('--save-prefix', type=str, default='',
+    parser.add_argument('--save-prefix', type=str, default=os.path.expanduser('.'),
                         help='Saving parameter prefix')
     parser.add_argument('--save-interval', type=int, default=10,
                         help='Saving parameters epoch interval, best model will always be saved.')
@@ -89,6 +93,10 @@ def parse_args():
                         'Currently supports only COCO.')
     parser.add_argument('--amp', action='store_true',
                         help='Use MXNet AMP for mixed precision training.')
+    parser.add_argument('--no-cuda', action='store_true',
+                        help='whether to disable GPU for training')
+    parser.add_argument('--low-precision-type', type=str, default='float16',
+                        help='choose float16 or bfloat16')
     parser.add_argument('--horovod', action='store_true',
                         help='Use MXNet Horovod for distributed training. Must be run with OpenMPI. '
                         '--gpus is ignored when using --horovod.')
@@ -96,6 +104,8 @@ def parse_args():
     args = parser.parse_args()
     if args.horovod:
         assert hvd, "You are trying to use horovod support but it's not installed"
+    if args.no_cuda:
+        args.gpus = ''
     return args
 
 def get_dataset(dataset, args):
@@ -118,7 +128,7 @@ def get_dataset(dataset, args):
         raise NotImplementedError('Dataset: {} not implemented.'.format(dataset))
     return train_dataset, val_dataset, val_metric
 
-def get_dataloader(net, train_dataset, val_dataset, data_shape, batch_size, num_workers, ctx):
+def get_dataloader(net, train_dataset, val_dataset, data_shape, batch_size, num_workers, ctx, horovod):
     """Get dataloader."""
     width, height = data_shape, data_shape
     # use fake data to generate fixed anchors for target generation
@@ -126,9 +136,16 @@ def get_dataloader(net, train_dataset, val_dataset, data_shape, batch_size, num_
         _, _, anchors = net(mx.nd.zeros((1, 3, height, width), ctx))
     anchors = anchors.as_in_context(mx.cpu())
     batchify_fn = Tuple(Stack(), Stack(), Stack())  # stack image, cls_targets, box_targets
+
+    if horovod:
+        sampler_fn = SplitSampler(len(train_dataset), num_parts=hvd.size(), part_index=hvd.rank())
+        shuffle = False
+    else:
+        sampler_fn = None
+        shuffle = True
     train_loader = gluon.data.DataLoader(
         train_dataset.transform(SSDDefaultTrainTransform(width, height, anchors)),
-        batch_size, True, batchify_fn=batchify_fn, last_batch='rollover', num_workers=num_workers)
+        batch_size, shuffle=shuffle, sampler=sampler_fn, batchify_fn=batchify_fn, last_batch='rollover', num_workers=num_workers)
     val_batchify_fn = Tuple(Stack(), Pad(pad_val=-1))
     val_loader = gluon.data.DataLoader(
         val_dataset.transform(SSDDefaultValTransform(width, height)),
@@ -218,6 +235,20 @@ def save_params(net, best_map, current_map, epoch, save_interval, prefix):
     if save_interval and epoch % save_interval == 0:
         net.save_params('{:s}_{:04d}_{:.4f}.params'.format(prefix, epoch, current_map))
 
+def save_params_states_hvd(net, trainer, rank_id, epoch, save_interval, prefix):
+    assert prefix != '', "args.save_prefix should be provided!"
+
+    if save_interval and epoch % save_interval == 0:
+        saved_name = '%s-rank%d-%d.params' % (prefix, rank_id, epoch - save_interval)
+        if epoch >= save_interval:
+            if os.path.exists(saved_name):
+                os.remove(saved_name)
+            if os.path.exists(saved_name.replace('.params', '.states')):
+                os.remove(saved_name.replace('.params', '.states'))
+        
+        net.save_params('%s-rank%d-%d.params' % (prefix, rank_id, epoch))
+        trainer.save_states('%s-rank%d-%d.params' % (prefix, rank_id, epoch))
+
 def validate(net, val_data, ctx, eval_metric):
     """Test on validation dataset."""
     eval_metric.reset()
@@ -264,7 +295,12 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
                     {'learning_rate': args.lr, 'wd': args.wd, 'momentum': args.momentum},
                     update_on_kvstore=(False if args.amp else None))
 
-    if args.amp:
+    if args.resume_states.strip():
+        # resume training from checkpoint
+        trainer.load_states(args.resume_states)
+
+    if args.amp and args.low_precision_type == 'float16':
+        # only do loss scaling for float16
         amp.init_trainer(trainer)
 
     # lr decay policy
@@ -322,7 +358,7 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
                     box_preds.append(box_pred)
                 sum_loss, cls_loss, box_loss = mbox_loss(
                     cls_preds, box_preds, cls_targets, box_targets)
-                if args.amp:
+                if args.amp and args.low_precision_type == 'float16':
                     with amp.scale_loss(sum_loss, trainer) as scaled_loss:
                         autograd.backward(scaled_loss)
                 else:
@@ -356,12 +392,17 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
             else:
                 current_map = 0.
             save_params(net, best_map, current_map, epoch, args.save_interval, args.save_prefix)
+            
+        # if args.horovod and hvd.size() > 1:
+        #     save_params_states_hvd(net, trainer, hvd.rank(), epoch, args.save_interval, args.save_prefix)
+        # else:
+        #     save_params(net, best_map, current_map, epoch, args.save_interval, args.save_prefix)
 
 if __name__ == '__main__':
     args = parse_args()
 
     if args.amp:
-        amp.init()
+        amp.init(target_dtype=args.low_precision_type)
 
     if args.horovod:
         hvd.init()
@@ -371,14 +412,14 @@ if __name__ == '__main__':
 
     # training contexts
     if args.horovod:
-        ctx = [mx.gpu(hvd.local_rank())]
+        ctx = [mx.gpu(hvd.local_rank())] if not args.no_cuda else [mx.cpu(hvd.local_rank())]
     else:
         ctx = [mx.gpu(int(i)) for i in args.gpus.split(',') if i.strip()]
         ctx = ctx if ctx else [mx.cpu()]
 
     # network
     net_name = '_'.join(('ssd', str(args.data_shape), args.network, args.dataset))
-    args.save_prefix += net_name
+    args.save_prefix += '/' + net_name
     if args.syncbn and len(ctx) > 1:
         net = get_model(net_name, pretrained_base=True, norm_layer=gluon.contrib.nn.SyncBatchNorm,
                         norm_kwargs={'num_devices': len(ctx)})
@@ -386,9 +427,9 @@ if __name__ == '__main__':
     else:
         net = get_model(net_name, pretrained_base=True, norm_layer=gluon.nn.BatchNorm)
         async_net = net
-    if args.resume.strip():
-        net.load_parameters(args.resume.strip())
-        async_net.load_parameters(args.resume.strip())
+    if args.resume_params.strip():
+        net.load_parameters(args.resume_params.strip())
+        async_net.load_parameters(args.resume_params.strip())
     else:
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
@@ -410,9 +451,8 @@ if __name__ == '__main__':
         train_dataset, val_dataset, eval_metric = get_dataset(args.dataset, args)
         batch_size = (args.batch_size // hvd.size()) if args.horovod else args.batch_size
         train_data, val_data = get_dataloader(
-            async_net, train_dataset, val_dataset, args.data_shape, batch_size, args.num_workers, ctx[0])
-
-
+            async_net, train_dataset, val_dataset, args.data_shape, batch_size, args.num_workers,
+            ctx[0], args.horovod)
 
     # training
     train(net, train_data, val_data, eval_metric, ctx, args)
