@@ -325,6 +325,20 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
     logger.info('Start training from [Epoch {}]'.format(args.start_epoch))
     best_map = [0]
 
+    profiler_on = os.getenv('SSD_PROFILING', False) and (not args.horovod or (hvd.rank() == 0))
+    if profiler_on:
+        logging.info("Profiling is enabled")
+
+    stop_iter = int(os.getenv('SSD_STOP_ITERATION', '0'))
+    if stop_iter > 0:
+        logging.info("Training will stop at iteration {} of the first epoch".format(stop_iter))
+
+    if profiler_on:
+        mx.profiler.set_config(profile_symbolic=True, profile_imperative=True, profile_memory=False,
+                               profile_api=True, filename='ssd_%s_profile.json' % args.network, aggregate_stats=True)
+        mx.profiler.set_state('run')
+
+    early_stop = False
     for epoch in range(args.start_epoch, args.epochs):
         while lr_steps and epoch >= lr_steps[0]:
             new_lr = trainer.learning_rate * lr_decay
@@ -378,6 +392,14 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
                         epoch, i, args.batch_size/(time.time()-btic), name1, loss1, name2, loss2))
                 btic = time.time()
 
+            if stop_iter > 0 and i >= (stop_iter - 1):
+                early_stop = True
+                logging.info("Training stopped at {} iteration. Clear SSD_STOP_ITERATION if it's not itended.".format(stop_iter))
+                break
+
+        if early_stop:
+            break
+
         if (not args.horovod or hvd.rank() == 0):
             name1, loss1 = ce_metric.get()
             name2, loss2 = smoothl1_metric.get()
@@ -397,6 +419,10 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
         #     save_params_states_hvd(net, trainer, hvd.rank(), epoch, args.save_interval, args.save_prefix)
         # else:
         #     save_params(net, best_map, current_map, epoch, args.save_interval, args.save_prefix)
+
+    if profiler_on:
+        mx.profiler.set_state('stop')
+        print(mx.profiler.dumps())
 
 if __name__ == '__main__':
     args = parse_args()
