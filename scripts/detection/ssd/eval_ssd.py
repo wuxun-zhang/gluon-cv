@@ -68,6 +68,10 @@ def parse_args():
                              ' thresholds. This mode is expected to produce the best inference accuracy of all three'
                              ' kinds of quantized models if the calibration dataset is representative enough of the'
                              ' inference dataset.')
+    parser.add_argument('--data-dir', type=str, default='~/.mxnet/datasets',
+                        help="whether to use dataset of RecordIO format")
+    parser.add_argument('--use-rec', action='store_true',
+                        help="whether to use dataset of RecordIO format")
     args = parser.parse_args()
     return args
 
@@ -93,6 +97,30 @@ def get_dataloader(val_dataset, data_shape, batch_size, num_workers):
         batch_size=batch_size, shuffle=False, last_batch='rollover', num_workers=num_workers)
     return val_loader
 
+def get_date_rec(data_dir, data_shape, batch_size, num_workers):
+    path_imgrec = data_dir + '/val.rec'
+    path_imglist = data_dir + '/val.lst'
+    num_samples = 117265
+
+    val_dataset = mx.io.ImageDetRecordIter(
+        path_imglist        = path_imglist,
+        path_imgrec         = path_imgrec,
+        preprocess_threads  = num_workers,
+        data_shape          = data_shape,
+        shuffle             = False,
+        ctx                 = 'cpu',
+        mean_r              = 0.485,
+        mean_g              = 0.456,
+        mean_b              = 0.406,
+        std_r               = 0.229,
+        std_g               = 0.224,
+        std_b               = 0.225,
+    )
+
+    val_metric = None
+
+    return val_dataset, val_metric, num_samples
+
 def benchmarking(net, ctx, num_iteration, datashape=300, batch_size=64):
     input_shape = (batch_size, 3) + (datashape, datashape)
     data = mx.random.uniform(-1.0, 1.0, shape=input_shape, ctx=ctx, dtype='float32')
@@ -110,12 +138,14 @@ def benchmarking(net, ctx, num_iteration, datashape=300, batch_size=64):
 def validate(net, val_data, ctx, classes, size, metric):
     """Test on validation dataset."""
     net.collect_params().reset_ctx(ctx)
-    metric.reset()
+    # metric.reset()
     with tqdm(total=size) as pbar:
         start = time.time()
         for ib, batch in enumerate(val_data):
-            data = gluon.utils.split_and_load(batch[0], ctx_list=ctx, batch_axis=0, even_split=False)
-            label = gluon.utils.split_and_load(batch[1], ctx_list=ctx, batch_axis=0, even_split=False)
+            # data = gluon.utils.split_and_load(batch[0], ctx_list=ctx, batch_axis=0, even_split=False)
+            # label = gluon.utils.split_and_load(batch[1], ctx_list=ctx, batch_axis=0, even_split=False)
+            data = gluon.utils.split_and_load(batch.data[0], ctx_list=ctx, batch_axis=0, even_split=False)
+            label = gluon.utils.split_and_load(batch.label[1], ctx_list=ctx, batch_axis=0, even_split=False)
             det_bboxes = []
             det_ids = []
             det_scores = []
@@ -127,14 +157,15 @@ def validate(net, val_data, ctx, classes, size, metric):
                 det_ids.append(ids)
                 det_scores.append(scores)
                 # clip to image size
-                det_bboxes.append(bboxes.clip(0, batch[0].shape[2]))
+                # det_bboxes.append(bboxes.clip(0, batch[0].shape[2]))
+                det_bboxes.append(bboxes.clip(0, batch.data[0].shape[2]))
                 # split ground truths
                 gt_ids.append(y.slice_axis(axis=-1, begin=4, end=5))
                 gt_bboxes.append(y.slice_axis(axis=-1, begin=0, end=4))
                 gt_difficults.append(y.slice_axis(axis=-1, begin=5, end=6) if y.shape[-1] > 5 else None)
 
             metric.update(det_bboxes, det_ids, det_scores, gt_bboxes, gt_ids, gt_difficults)
-            pbar.update(batch[0].shape[0])
+            pbar.update(batch.data[0].shape[0])
         end = time.time()
         speed = size / (end - start)
         print('Throughput is %f img/sec.'% speed)
@@ -182,10 +213,18 @@ if __name__ == '__main__':
         sys.exit()
 
     # eval data
-    val_dataset, val_metric = get_dataset(args.dataset, args.data_shape)
-    val_data = get_dataloader(
-        val_dataset, args.data_shape, args.batch_size, args.num_workers)
-    classes = val_dataset.classes  # class names
+    if not args.use_rec:
+        val_dataset, val_metric = get_dataset(args.dataset, args.data_shape)
+        val_data = get_dataloader(
+            val_dataset, args.data_shape, args.batch_size, args.num_workers)
+        classes = val_dataset.classes  # class names
+        num_samples = len(val_dataset)
+    else:
+        args.data_dir += '/' + args.dataset
+        assert os.path.isdir(args.data_dir), "Please provide dataset directory when args.use_rec is True"
+        classes = None
+        val_data, val_metric, num_samples = get_data_rec(
+            args.data_dir, args.data_shape, args.batch_size, args.num_workers)
 
     # calibration
     if args.calibration and not args.quantized:
@@ -209,6 +248,6 @@ if __name__ == '__main__':
         sys.exit()
 
     # eval
-    names, values = validate(net, val_data, ctx, classes, len(val_dataset), val_metric)
+    names, values = validate(net, val_data, ctx, classes, num_samples, val_metric)
     for k, v in zip(names, values):
         print(k, v)
