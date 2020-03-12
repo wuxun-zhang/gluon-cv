@@ -597,8 +597,8 @@ def ssd_300_mobilenet1_0_coco(pretrained=False, pretrained_base=True, **kwargs):
     from ...data import COCODetection
     classes = COCODetection.CLASSES
     return get_ssd('mobilenet1.0', 300,
-                   features=['relu22_fwd', 'relu26_fwd'],
-                   filters=[256, 256, 128, 128],
+                   features=['relu10_fwd', 'relu22_fwd', 'relu26_fwd'],
+                   filters=[256, 256, 128],
                    sizes=[21, 45, 99, 153, 207, 261, 315],
                    ratios=[[1, 2, 0.5]] + [[1, 2, 0.5, 3, 1.0/3]] * 3 + [[1, 2, 0.5]] * 2,
                    steps=[8, 16, 32, 64, 100, 300],
